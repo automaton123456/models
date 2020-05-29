@@ -23,6 +23,7 @@ import inspect
 import math
 import six
 import tensorflow.compat.v1 as tf
+import tensorflow_probability as tfp
 
 # pylint: disable=g-import-not-at-top
 try:
@@ -155,6 +156,31 @@ def policy_v3():
   ]
   return policy
 
+def select_and_apply_random_policy_augmix(policies,
+                                          image,
+                                          bboxes,
+                                          mixture_width=3,
+                                          mixture_depth=-1,
+                                          alpha=1):
+  """Select a random policy from `policies` and apply it to `image`."""
+  policy_to_select = tf.random_uniform([], maxval=len(policies), dtype=tf.int32)
+  # Note that using tf.case instead of tf.conds would result in significantly
+  # larger graphs and would even break export for some larger policies.
+  ws = tfp.distributions.Dirichlet([alpha] * mixture_width).sample()
+  m = tfp.distributions.Beta(alpha, alpha).sample()
+  mix = tf.zeros_like(image, dtype=tf.float32)
+  for j in range(mixture_width):
+    aug_image = image
+    depth = mixture_depth if mixture_depth > 0 else np.random.randint(1, 4)
+    for _ in range(depth):
+      for (i, policy) in enumerate(policies):
+        aug_image, bboxes = tf.cond(
+            tf.equal(i, policy_to_select),
+            lambda policy_fn=policy, img=aug_image: policy_fn(img, bboxes),
+            lambda img=aug_image: (img, bboxes))
+    mix += ws[j] * tf.cast(aug_image, tf.float32)
+  mixed = tf.cast((1 - m) * tf.cast(image, tf.float32) + m * mix, tf.uint8)
+  return (mixed, bboxes)
 
 def blend(image1, image2, factor):
   """Blend image1 and image2 using 'factor'.
@@ -1122,8 +1148,10 @@ def sharpness(image, factor):
   # Tile across channel dimension.
   kernel = tf.tile(kernel, [1, 1, 3, 1])
   strides = [1, 1, 1, 1]
-  degenerate = tf.nn.depthwise_conv2d(
-      image, kernel, strides, padding='VALID', rate=[1, 1])
+  with tf.device('/cpu:0'):
+      degenerate = tf.nn.depthwise_conv2d(
+          image, kernel, strides, padding='VALID', rate=[1, 1])
+      
   degenerate = tf.clip_by_value(degenerate, 0.0, 255.0)
   degenerate = tf.squeeze(tf.cast(degenerate, tf.uint8), [0])
 
@@ -1603,10 +1631,16 @@ def build_and_apply_nas_policy(policies, image, bboxes,
       return final_policy
     tf_policies.append(make_final_policy(tf_policy))
 
-  augmented_image, augmented_bbox = select_and_apply_random_policy(
-      tf_policies, image, bboxes)
+  #Added augmix  
+  augmented_image, augmented_bboxes = select_and_apply_random_policy_augmix(
+        tf_policies, image, bboxes, 3, -1, 1)   
+    
+  #augmented_image, augmented_bbox = select_and_apply_random_policy(
+  #    tf_policies, image, bboxes)
   # If no bounding boxes were specified, then just return the images.
   return (augmented_image, augmented_bbox)
+
+
 
 
 # TODO(barretzoph): Add in ArXiv link once paper is out.
